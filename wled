@@ -4,11 +4,17 @@ import json
 import urllib.request
 import sys
 import os
+import threading
+import ipaddress
+import socket
+import tty
+import termios
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 INFO_FILE = os.path.join(DATA_DIR, "info.json")
 LAST_STATE_FILE = os.path.join(DATA_DIR, "last-state.json")
+INSTANCES_FILE = os.path.join(DATA_DIR, "instances.json")
 
 config = {"ip": None, "state_changed": False}
 
@@ -156,6 +162,167 @@ def cmd_info():
     print(f"MAC       : {info.get('mac', '?')}")
 
 
+def get_local_subnet():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = config.get("ip")
+        if not local_ip:
+            sys.exit("cannot detect network — set an IP first: wled ip <address>")
+    parts = local_ip.split(".")
+    return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+
+
+def cmd_scan():
+    subnet = get_local_subnet()
+    hosts = list(ipaddress.ip_network(subnet).hosts())
+    total = len(hosts)
+    found = []
+    counter = [0]
+    lock = threading.Lock()
+
+    def update_bar():
+        width = 30
+        filled = int(counter[0] / total * width)
+        bar = "█" * filled + "░" * (width - filled)
+        print(f"\r[{bar}] {counter[0]}/{total}", end="", flush=True)
+
+    def probe(host):
+        ip_str = str(host)
+        device = None
+        try:
+            with urllib.request.urlopen(f"http://{ip_str}/json/info", timeout=0.5) as r:
+                info = json.load(r)
+                if "leds" in info:
+                    device = {"ip": ip_str, "name": info.get("name", "unknown")}
+        except Exception:
+            pass
+        with lock:
+            counter[0] += 1
+            if device:
+                found.append(device)
+                print(f"\r  found: {device['name']} ({ip_str})" + " " * 20)
+            update_bar()
+
+    print(f"Scanning {subnet}...")
+    threads = [threading.Thread(target=probe, args=(h,)) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print()
+    instances = [{"id": i + 1, "name": d["name"], "ip": d["ip"]} for i, d in enumerate(found)]
+    save_json(INSTANCES_FILE, instances)
+    print(f"found {len(instances)} instance(s) — saved to instances.json")
+
+
+def find_instance(instances, query):
+    query = query.strip()
+    for inst in instances:
+        if query == str(inst["id"]) or query == inst["name"] or query == inst["ip"]:
+            return inst
+    return None
+
+
+def interactive_select(instances):
+    current_ip = config.get("ip")
+    idx = next((i for i, inst in enumerate(instances) if inst["ip"] == current_ip), 0)
+    query = ""
+    prev_lines = 0
+
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    def w(text=""):
+        sys.stdout.write(text + "\r\n")
+
+    def make_lines():
+        lines = []
+        match = next((inst for inst in instances if inst["ip"] == current_ip), None)
+        if match:
+            lines.append(f"Currently selected: {match['name']} ({match['ip']})")
+        else:
+            lines.append("Currently selected: none")
+        lines.append("")
+        for i, inst in enumerate(instances):
+            if i == idx:
+                lines.append(f"{CYAN}{BOLD}► {inst['id']}. {inst['name']} ({inst['ip']}){RESET}")
+            else:
+                lines.append(f"  {inst['id']}. {inst['name']} ({inst['ip']})")
+        lines.append("")
+        lines.append(f"  > {query}_" if query else "  ↑↓ navigate   Enter select   type to search")
+        return lines
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    try:
+        tty.setraw(fd)
+        while True:
+            lines = make_lines()
+            if prev_lines:
+                sys.stdout.write(f"\033[{prev_lines}A\033[J")
+            for line in lines:
+                w(line)
+            sys.stdout.flush()
+            prev_lines = len(lines)
+
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A":
+                    query = ""
+                    idx = max(0, idx - 1)
+                elif seq == "[B":
+                    query = ""
+                    idx = min(len(instances) - 1, idx + 1)
+            elif ch in ("\r", "\n"):
+                break
+            elif ch == "\x03":
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                sys.stdout.write(f"\033[{prev_lines}A\033[J")
+                sys.stdout.flush()
+                sys.exit(0)
+            elif ch == "\x7f":
+                query = query[:-1]
+            elif ch.isprintable():
+                query += ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    sys.stdout.write(f"\033[{prev_lines}A\033[J")
+    sys.stdout.flush()
+
+    if query:
+        return find_instance(instances, query)
+    return instances[idx]
+
+
+def cmd_select(arg=None):
+    if not os.path.exists(INSTANCES_FILE):
+        sys.exit("no instances — run: wled scan")
+    instances = load_json(INSTANCES_FILE)
+    if not instances:
+        sys.exit("instances.json empty — run: wled scan")
+
+    if arg is None:
+        instance = interactive_select(instances)
+        if not instance:
+            sys.exit("no matching instance")
+    else:
+        instance = find_instance(instances, arg)
+        if not instance:
+            sys.exit(f"no instance matching '{arg}'")
+
+    config["ip"] = instance["ip"]
+    print(f"selected: {instance['name']} ({instance['ip']})")
+
+
 def cmd_help():
     print("""wled — WLED CLI controller
 
@@ -170,6 +337,9 @@ Usage:
   wled status       alias for state
   wled ip <addr>    set WLED IP address
   wled info         show device info
+  wled scan         scan network for WLED instances
+  wled select       pick active instance from scan results
+  wled select <id|name|ip>  select instance directly
   wled help         show this help
   wled -h/--help    show this help""")
 
@@ -200,6 +370,10 @@ def main():
         cmd_set_ip(args[1])
     elif args[0] == "info":
         cmd_info()
+    elif args[0] == "scan":
+        cmd_scan()
+    elif args[0] == "select":
+        cmd_select(args[1] if len(args) > 1 else None)
     elif args[0] == "max":
         cmd_brightness(255)
     elif len(args) == 1 and args[0].isdigit():

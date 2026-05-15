@@ -23,7 +23,7 @@ Validates the connection, saves device info to `info.json`.
 
 ## Usage
 
-```
+```bash
 wled                toggle power
 wled on             turn on
 wled on <1-255>     turn on at brightness
@@ -32,6 +32,9 @@ wled <1-255>        set brightness (device must be on)
 wled max            set brightness to 255 (device must be on)
 wled state          show current state
 wled status         alias for state
+wled scan           scan network for WLED instances
+wled select         interactive instance picker
+wled select <x>     select by id, name, or ip
 wled ip <addr>      set WLED IP address
 wled info           show saved device info
 wled help           show this help
@@ -40,7 +43,7 @@ wled -h, --help     show this help
 
 ## State display
 
-```
+```bash
 WLED State (192.168.1.100)
 ═════════════════════════════
 Power      : ON
@@ -52,11 +55,12 @@ Segment    : 0 (0-120 LEDs) ON
 
 ## Local files
 
-| File | Purpose |
-|------|---------|
-| `config.json` | Persisted IP and state-changed flag |
-| `info.json` | Device info snapshot (written on `wled ip`) |
+| File              | Purpose                                          |
+| ----------------- | ------------------------------------------------ |
+| `config.json`     | Persisted IP and state-changed flag              |
+| `info.json`       | Device info snapshot (written on `wled ip`)      |
 | `last-state.json` | Cached state (refreshed only when state changes) |
+| `instances.json`  | Scan results (written on `wled scan`)            |
 
 These are created next to the binary and are excluded from version control.
 
