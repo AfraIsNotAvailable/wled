@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+
+import json
+import urllib.request
+import sys
+import os
+
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+INFO_FILE = os.path.join(DATA_DIR, "info.json")
+LAST_STATE_FILE = os.path.join(DATA_DIR, "last-state.json")
+
+config = {"ip": None, "state_changed": False}
+
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            config.update(json.load(f))
+
+
+def save_config():
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_ip():
+    ip = config.get("ip")
+    if not ip:
+        sys.exit("No IP set. Run: wled ip <address>")
+    return ip
+
+
+def wled_get(path):
+    ip = get_ip()
+    with urllib.request.urlopen(f"http://{ip}/json{path}") as resp:
+        return json.load(resp)
+
+
+def wled_post(path, data):
+    ip = get_ip()
+    req = urllib.request.Request(
+        f"http://{ip}/json{path}",
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.load(resp)
+
+
+def brightness_bar(bri, width=20):
+    filled = int(bri / 255 * width)
+    empty = width - filled
+    return "█" * filled + "░" * empty
+
+
+def display_state(state):
+    ip = config.get("ip", "?")
+    seg = state.get("seg", [{}])[0]
+    power = "ON" if state.get("on") else "OFF"
+    bri = state.get("bri", 0)
+    pct = int(bri / 255 * 100)
+    bar = brightness_bar(bri)
+    fx = seg.get("fx", 0)
+    pal = seg.get("pal", 0)
+    seg_start = seg.get("start", 0)
+    seg_stop = seg.get("stop", 0)
+    seg_on = "ON" if seg.get("on") else "OFF"
+
+    print(f"WLED State ({ip})")
+    print("═" * 29)
+    print(f"Power      : {power}")
+    print(f"Brightness : {pct}% [{bar}] ({bri}/255)")
+    print(f"Effect     : ({fx})")
+    print(f"Palette    : ({pal})")
+    print(f"Segment    : 0 ({seg_start}‑{seg_stop} LEDs) {seg_on}")
+
+
+def cmd_toggle():
+    wled_post("/state", {"on": "t"})
+    config["state_changed"] = True
+    print("toggled")
+
+
+def cmd_on(bri=None):
+    payload = {"on": True}
+    if bri is not None:
+        payload["bri"] = bri
+    wled_post("/state", payload)
+    config["state_changed"] = True
+    msg = "turned on"
+    if bri is not None:
+        msg += f" at brightness {bri}"
+    print(msg)
+
+
+def cmd_off():
+    wled_post("/state", {"on": False})
+    config["state_changed"] = True
+    print("turned off")
+
+
+def cmd_state():
+    display_state(get_current_state())
+
+
+def get_current_state():
+    if not config.get("state_changed") and os.path.exists(LAST_STATE_FILE):
+        return load_json(LAST_STATE_FILE)
+    state = wled_get("/state")
+    save_json(LAST_STATE_FILE, state)
+    config["state_changed"] = False
+    return state
+
+
+def cmd_brightness(bri):
+    if not 1 <= bri <= 255:
+        sys.exit("brightness must be 1..255")
+    state = get_current_state()
+    if not state.get("on"):
+        sys.exit("turn it on first!")
+    wled_post("/state", {"bri": bri})
+    config["state_changed"] = True
+    print(f"brightness → {bri}")
+
+
+def cmd_set_ip(ip):
+    try:
+        with urllib.request.urlopen(f"http://{ip}/json/info", timeout=5) as resp:
+            info = json.load(resp)
+    except Exception as e:
+        sys.exit(f"cannot reach {ip}: {e}")
+    config["ip"] = ip
+    save_json(INFO_FILE, info)
+    print(f"IP set to {ip}, info saved to info.json")
+
+
+def cmd_info():
+    if not os.path.exists(INFO_FILE):
+        sys.exit("no info.json — run: wled ip <address>")
+    info = load_json(INFO_FILE)
+    print(f"Name      : {info.get('name', '?')}")
+    print(f"Version   : {info.get('ver', '?')}")
+    print(f"LED count : {info.get('leds', {}).get('count', '?')}")
+    print(f"MAC       : {info.get('mac', '?')}")
+
+
+def cmd_help():
+    print("""wled — WLED CLI controller
+
+Usage:
+  wled              toggle power
+  wled on           turn on
+  wled on <1-255>   turn on at brightness
+  wled off          turn off
+  wled <1-255>      set brightness (must be on)
+  wled max          set brightness to 255 (must be on)
+  wled state        show current state
+  wled status       alias for state
+  wled ip <addr>    set WLED IP address
+  wled info         show device info
+  wled help         show this help
+  wled -h/--help    show this help""")
+
+
+def main():
+    load_config()
+    args = sys.argv[1:]
+
+    if not args:
+        cmd_toggle()
+    elif args[0] in ("-h", "--help", "help"):
+        cmd_help()
+    elif args[0] == "on":
+        if len(args) == 2 and args[1].isdigit():
+            bri = int(args[1])
+            if not 1 <= bri <= 255:
+                sys.exit("brightness must be 1..255")
+            cmd_on(bri)
+        else:
+            cmd_on()
+    elif args[0] == "off":
+        cmd_off()
+    elif args[0] in ("state", "status"):
+        cmd_state()
+    elif args[0] == "ip":
+        if len(args) < 2:
+            sys.exit("usage: wled ip <address>")
+        cmd_set_ip(args[1])
+    elif args[0] == "info":
+        cmd_info()
+    elif args[0] == "max":
+        cmd_brightness(255)
+    elif len(args) == 1 and args[0].isdigit():
+        cmd_brightness(int(args[0]))
+    else:
+        sys.exit(f"unknown command: {args[0]}\nRun 'wled help' for usage.")
+
+    save_config()
+
+
+if __name__ == "__main__":
+    main()
